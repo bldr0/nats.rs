@@ -469,7 +469,16 @@ pub(crate) struct ConnectionHandler {
     should_reconnect: bool,
     flush_observers: Vec<oneshot::Sender<()>>,
     is_draining: bool,
-    drain_pings: VecDeque<u64>,
+    sent_pings: VecDeque<SentPing>,
+}
+
+/// A PING the handler sent whose PONG hasn't come yet. nats-server answers a connection's PINGs in
+/// the order it reads them, so each PONG answers the oldest one sent.
+enum SentPing {
+    /// The keep-alive's.
+    KeepAlive,
+    /// A drain's, sent after the UNSUBs of these subscriptions.
+    Drain(Vec<u64>),
 }
 
 impl ConnectionHandler {
@@ -493,7 +502,7 @@ impl ConnectionHandler {
             should_reconnect: false,
             flush_observers: Vec::new(),
             is_draining: false,
-            drain_pings: VecDeque::new(),
+            sent_pings: VecDeque::new(),
         }
     }
 
@@ -527,6 +536,7 @@ impl ConnectionHandler {
                     Poll::Ready(ExitReason::Disconnected(None))
                 } else {
                     self.handler.connection.enqueue_write_op(&ClientOp::Ping);
+                    self.handler.sent_pings.push_back(SentPing::KeepAlive);
 
                     Poll::Pending
                 }
@@ -574,19 +584,17 @@ impl ConnectionHandler {
                     }
                 }
 
-                // Before handling any commands, drop any subscriptions which are draining
-                // Note: safe to assume subscription drain has completed at this point, as we would have flushed
-                // all outgoing UNSUB messages in the previous call to this fn, and we would have processed and
-                // delivered any remaining messages to the subscription in the loop above.
-                while let Some(sid) = self.handler.drain_pings.pop_front() {
-                    self.handler.subscriptions.remove(&sid);
-                }
-
-                if self.handler.is_draining {
-                    // The entire connection is draining. This means we flushed outgoing messages in the previous
-                    // call to this fn, we handled any remaining messages from the server in the loop above, and
-                    // all subs were drained, so drain is complete and we should exit instead of processing any
-                    // further messages
+                if self.handler.is_draining
+                    && !self
+                        .handler
+                        .sent_pings
+                        .iter()
+                        .any(|ping| matches!(ping, SentPing::Drain(_)))
+                {
+                    // The entire connection is draining, and the server answered the drain's PING: it
+                    // has read every UNSUB and every message sent before it, and the loop above
+                    // delivered every message it sent back before its PONG. The drain is complete,
+                    // so exit instead of processing any further messages.
                     return Poll::Ready(ExitReason::Closed);
                 }
 
@@ -715,7 +723,22 @@ impl ConnectionHandler {
             }
             ServerOp::Pong => {
                 debug!("received PONG");
-                self.pending_pings = self.pending_pings.saturating_sub(1);
+                match self.sent_pings.pop_front() {
+                    Some(SentPing::Drain(sids)) => {
+                        // The server has read the drain's UNSUBs and sent, before this PONG, every
+                        // message it routed to these subscriptions, so their streams end here. The
+                        // same round trip nats.go's `Subscription.Drain` waits for in
+                        // `Conn.checkDrained`: "This allows us to know that whatever we have in the
+                        // client pending is correct and the server will not send additional
+                        // information."
+                        for sid in sids {
+                            self.subscriptions.remove(&sid);
+                        }
+                    }
+                    Some(SentPing::KeepAlive) | None => {
+                        self.pending_pings = self.pending_pings.saturating_sub(1);
+                    }
+                }
             }
             ServerOp::Error(error) => {
                 debug!("received ERROR: {:?}", error);
@@ -844,25 +867,26 @@ impl ConnectionHandler {
                 self.flush_observers.push(observer);
             }
             Command::Drain { sid } => {
-                let mut drain_sub = |sid: u64| {
-                    self.drain_pings.push_back(sid);
-                    self.connection
-                        .enqueue_write_op(&ClientOp::Unsubscribe { sid, max: None });
-                };
-
-                if let Some(sid) = sid {
-                    if self.subscriptions.get_mut(&sid).is_some() {
-                        drain_sub(sid);
+                let sids: Vec<u64> = if let Some(sid) = sid {
+                    if self.subscriptions.contains_key(&sid) {
+                        vec![sid]
+                    } else {
+                        Vec::new()
                     }
                 } else {
                     // sid isn't set, so drain the whole client
                     self.connector.events_tx.try_send(Event::Draining).ok();
                     self.is_draining = true;
-                    for &sid in self.subscriptions.keys() {
-                        drain_sub(sid);
-                    }
+                    self.subscriptions.keys().copied().collect()
+                };
+                for &sid in &sids {
+                    self.connection
+                        .enqueue_write_op(&ClientOp::Unsubscribe { sid, max: None });
                 }
+                // The subscriptions stay until the server answers this PING (`ServerOp::Pong`), so
+                // they still deliver what the server routed to them before it read their UNSUBs.
                 self.connection.enqueue_write_op(&ClientOp::Ping);
+                self.sent_pings.push_back(SentPing::Drain(sids));
             }
             Command::Subscribe {
                 sid,
@@ -980,6 +1004,15 @@ impl ConnectionHandler {
 
     async fn handle_disconnect(&mut self) -> Result<(), ConnectError> {
         self.pending_pings = 0;
+        // No PONG comes on a lost connection. A draining subscription ends here: the server forgot
+        // it with the connection, so nothing more comes for it, and it must not subscribe again.
+        for ping in self.sent_pings.drain(..) {
+            if let SentPing::Drain(sids) = ping {
+                for sid in sids {
+                    self.subscriptions.remove(&sid);
+                }
+            }
+        }
         self.connector.events_tx.try_send(Event::Disconnected).ok();
         self.connector.state_tx.send(State::Disconnected).ok();
 

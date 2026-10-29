@@ -1409,6 +1409,73 @@ mod client {
         assert!(sub2.next().await.is_some());
     }
 
+    // A drained subscription still delivers what the server routed to it before it read the UNSUB:
+    // the subscription ends only once the server answers the PING the drain sends after it. Here
+    // the server answers only after the client has handled other commands, and routes one more
+    // message before its PONG.
+    #[tokio::test]
+    async fn drain_subscription_delivers_messages_routed_before_the_server_read_its_unsubscribe() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (answer_tx, answer_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let server = tokio::spawn(async move {
+            let (stream, _peer) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut lines = tokio::io::BufReader::new(read).lines();
+            let info = format!("INFO {{\"server_id\":\"test\",\"server_name\":\"test\",\"version\":\"2.10.0\",\"proto\":1,\"host\":\"127.0.0.1\",\"port\":{},\"max_payload\":1048576}}\r\n", addr.port());
+            write.write_all(info.as_bytes()).await.unwrap();
+            // CONNECT, then the handshake's PING.
+            while lines.next_line().await.unwrap().unwrap() != "PING" {}
+            write.write_all(b"PONG\r\n").await.unwrap();
+            let mut sid = None;
+            let mut unsubscribed = false;
+            loop {
+                let line = lines.next_line().await.unwrap().unwrap();
+                if let Some(rest) = line.strip_prefix("SUB test ") {
+                    sid = Some(rest.to_string());
+                } else if line.starts_with("UNSUB ") {
+                    unsubscribed = true;
+                } else if line == "PING" && unsubscribed {
+                    break;
+                }
+            }
+            // The drain's UNSUB and PING are read; answer only when the test says so.
+            answer_rx.await.unwrap();
+            let sid = sid.unwrap();
+            write
+                .write_all(format!("MSG test {sid} 4\r\nlate\r\nPONG\r\n").as_bytes())
+                .await
+                .unwrap();
+            // Keep the connection open until the test ends.
+            while lines.next_line().await.unwrap().is_some() {}
+        });
+
+        let client = async_nats::connect(format!("nats://127.0.0.1:{}", addr.port()))
+            .await
+            .unwrap();
+        let mut sub = client.subscribe("test").await.unwrap();
+        sub.drain().await.unwrap();
+        // The connection handler runs again before the server answers the drain's PING.
+        client.flush().await.unwrap();
+        client.flush().await.unwrap();
+        answer_tx.send(()).unwrap();
+
+        let late = tokio::time::timeout(Duration::from_secs(5), sub.next())
+            .await
+            .expect("the stream yields or ends within 5 s");
+        assert_eq!(
+            late.expect("the message routed before the server read the UNSUB")
+                .payload,
+            Bytes::from("late")
+        );
+        let end = tokio::time::timeout(Duration::from_secs(5), sub.next())
+            .await
+            .expect("the stream ends within 5 s");
+        assert!(end.is_none());
+        server.abort();
+    }
+
     #[tokio::test]
     async fn drain_subscription_unsub_after() {
         let server = nats_server::run_basic_server();
