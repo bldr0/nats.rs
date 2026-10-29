@@ -866,7 +866,15 @@ impl Client {
         Ok(Subscriber::new(sid, self.sender.clone(), receiver))
     }
 
-    /// Flushes the internal buffer ensuring that all messages are sent.
+    /// Flushes the internal buffer ensuring that all messages are sent, and returns once the server
+    /// has processed them: the client writes a PING after everything queued before this call and
+    /// waits for the server's PONG. "A flush sends a PING to the server and waits for the PONG. The
+    /// server processes what a connection sends in order, so when the PONG comes back, the server
+    /// has also received everything the client wrote before the PING — including every buffered
+    /// publish." (<https://docs.nats.io/learn/resilient-clients/drain-and-shutdown#flush>)
+    ///
+    /// Fails if the connection is lost before the PONG comes, since the server may not have read
+    /// what was written before it. It has no timeout of its own.
     ///
     /// # Examples
     ///
@@ -1314,9 +1322,8 @@ impl From<SubscribeError> for RequestError {
 pub enum FlushErrorKind {
     /// Sending the flush failed client side.
     SendError,
-    /// Flush failed.
-    /// This can happen mostly in case of connection issues
-    /// that cannot be resolved quickly.
+    /// Flush failed: the connection was lost, or the client closed, before the server answered
+    /// the flush's PING.
     FlushError,
 }
 

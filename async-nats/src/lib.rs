@@ -467,7 +467,6 @@ pub(crate) struct ConnectionHandler {
     info_sender: tokio::sync::watch::Sender<Option<ServerInfo>>,
     ping_interval: Interval,
     should_reconnect: bool,
-    flush_observers: Vec<oneshot::Sender<()>>,
     is_draining: bool,
     sent_pings: VecDeque<SentPing>,
 }
@@ -479,6 +478,9 @@ enum SentPing {
     KeepAlive,
     /// A drain's, sent after the UNSUBs of these subscriptions.
     Drain(Vec<u64>),
+    /// A flush's: its PONG tells the flush that the server has processed everything written before
+    /// it. Like the drain's, it does not count towards the keep-alive's pending pings.
+    Flush(oneshot::Sender<()>),
 }
 
 impl ConnectionHandler {
@@ -500,7 +502,6 @@ impl ConnectionHandler {
             info_sender,
             ping_interval,
             should_reconnect: false,
-            flush_observers: Vec::new(),
             is_draining: false,
             sent_pings: VecDeque::new(),
         }
@@ -656,20 +657,9 @@ impl ConnectionHandler {
                     }
                 }
 
-                if let (ShouldFlush::Yes, _) | (ShouldFlush::No, false) = (
-                    self.handler.connection.should_flush(),
-                    self.handler.flush_observers.is_empty(),
-                ) {
-                    match self.handler.connection.poll_flush(cx) {
-                        Poll::Pending => {}
-                        Poll::Ready(Ok(())) => {
-                            for observer in self.handler.flush_observers.drain(..) {
-                                let _ = observer.send(());
-                            }
-                        }
-                        Poll::Ready(Err(err)) => {
-                            return Poll::Ready(ExitReason::Disconnected(Some(err)))
-                        }
+                if self.handler.connection.should_flush() == ShouldFlush::Yes {
+                    if let Poll::Ready(Err(err)) = self.handler.connection.poll_flush(cx) {
+                        return Poll::Ready(ExitReason::Disconnected(Some(err)));
                     }
                 }
 
@@ -734,6 +724,13 @@ impl ConnectionHandler {
                         for sid in sids {
                             self.subscriptions.remove(&sid);
                         }
+                    }
+                    Some(SentPing::Flush(observer)) => {
+                        // "The server processes what a connection sends in order, so when the
+                        // PONG comes back, the server has also received everything the client
+                        // wrote before the PING"
+                        // (<https://docs.nats.io/learn/resilient-clients/drain-and-shutdown#flush>).
+                        let _ = observer.send(());
                     }
                     Some(SentPing::KeepAlive) | None => {
                         self.pending_pings = self.pending_pings.saturating_sub(1);
@@ -864,7 +861,10 @@ impl ConnectionHandler {
                 }
             }
             Command::Flush { observer } => {
-                self.flush_observers.push(observer);
+                // The flush returns when the server answers this PING (`ServerOp::Pong`), written
+                // after everything the client queued before it.
+                self.connection.enqueue_write_op(&ClientOp::Ping);
+                self.sent_pings.push_back(SentPing::Flush(observer));
             }
             Command::Drain { sid } => {
                 let sids: Vec<u64> = if let Some(sid) = sid {
@@ -1005,7 +1005,8 @@ impl ConnectionHandler {
     async fn handle_disconnect(&mut self) -> Result<(), ConnectError> {
         self.pending_pings = 0;
         // No PONG comes on a lost connection. A draining subscription ends here: the server forgot
-        // it with the connection, so nothing more comes for it, and it must not subscribe again.
+        // it with the connection, so nothing more comes for it, and it must not subscribe again. A
+        // flush fails: the server may not have read what was written before its PING.
         for ping in self.sent_pings.drain(..) {
             if let SentPing::Drain(sids) = ping {
                 for sid in sids {
