@@ -1411,8 +1411,8 @@ mod client {
 
     // A drained subscription still delivers what the server routed to it before it read the UNSUB:
     // the subscription ends only once the server answers the PING the drain sends after it. Here
-    // the server answers only after the client has handled other commands, and routes one more
-    // message before its PONG.
+    // the server answers only after the client has handled a message on another subscription, and
+    // routes one more message before its PONG.
     #[tokio::test]
     async fn drain_subscription_delivers_messages_routed_before_the_server_read_its_unsubscribe() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1429,18 +1429,27 @@ mod client {
             while lines.next_line().await.unwrap().unwrap() != "PING" {}
             write.write_all(b"PONG\r\n").await.unwrap();
             let mut sid = None;
+            let mut other = None;
             let mut unsubscribed = false;
             loop {
                 let line = lines.next_line().await.unwrap().unwrap();
                 if let Some(rest) = line.strip_prefix("SUB test ") {
                     sid = Some(rest.to_string());
+                } else if let Some(rest) = line.strip_prefix("SUB other ") {
+                    other = Some(rest.to_string());
                 } else if line.starts_with("UNSUB ") {
                     unsubscribed = true;
                 } else if line == "PING" && unsubscribed {
                     break;
                 }
             }
-            // The drain's UNSUB and PING are read; answer only when the test says so.
+            // The drain's UNSUB and PING are read. A message on the other subscription makes the
+            // client's connection handler run again; answer only when the test says so.
+            let other = other.unwrap();
+            write
+                .write_all(format!("MSG other {other} 4\r\npoke\r\n").as_bytes())
+                .await
+                .unwrap();
             answer_rx.await.unwrap();
             let sid = sid.unwrap();
             write
@@ -1455,10 +1464,13 @@ mod client {
             .await
             .unwrap();
         let mut sub = client.subscribe("test").await.unwrap();
+        let mut other = client.subscribe("other").await.unwrap();
         sub.drain().await.unwrap();
         // The connection handler runs again before the server answers the drain's PING.
-        client.flush().await.unwrap();
-        client.flush().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), other.next())
+            .await
+            .expect("the other subscription's message within 5 s")
+            .expect("the other subscription's message");
         answer_tx.send(()).unwrap();
 
         let late = tokio::time::timeout(Duration::from_secs(5), sub.next())
@@ -1474,6 +1486,100 @@ mod client {
             .expect("the stream ends within 5 s");
         assert!(end.is_none());
         server.abort();
+    }
+
+    // A mock server for the flush tests: it reads the client's CONNECT and handshake PING, answers
+    // it, then reads until the PING written after a publish to `test`, and tells `read` so.
+    async fn flush_server() -> (
+        u16,
+        tokio::sync::oneshot::Receiver<(
+            tokio::net::tcp::OwnedWriteHalf,
+            tokio::io::Lines<tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>>,
+        )>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (read_tx, read_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (stream, _peer) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut lines = tokio::io::BufReader::new(read).lines();
+            let info = format!("INFO {{\"server_id\":\"test\",\"server_name\":\"test\",\"version\":\"2.10.0\",\"proto\":1,\"host\":\"127.0.0.1\",\"port\":{port},\"max_payload\":1048576}}\r\n");
+            write.write_all(info.as_bytes()).await.unwrap();
+            // CONNECT, then the handshake's PING.
+            while lines.next_line().await.unwrap().unwrap() != "PING" {}
+            write.write_all(b"PONG\r\n").await.unwrap();
+            let mut published = false;
+            loop {
+                let line = lines.next_line().await.unwrap().unwrap();
+                if line.starts_with("PUB test ") {
+                    published = true;
+                } else if line == "PING" {
+                    assert!(published, "the flush's PING came before the publish");
+                    break;
+                }
+            }
+            read_tx.send((write, lines)).ok();
+            // Holds the listener, so the client's reconnects wait instead of failing.
+            std::future::pending::<()>().await;
+        });
+        (port, read_rx)
+    }
+
+    // `flush` returns only once the server has answered the PING it writes after everything sent
+    // before it: "A flush sends a PING to the server and waits for the PONG."
+    // (https://docs.nats.io/learn/resilient-clients/drain-and-shutdown#flush). The server here
+    // answers only when the test says so.
+    #[tokio::test]
+    async fn flush_returns_once_the_server_answers_its_ping() {
+        let (port, read) = flush_server().await;
+        let client = async_nats::connect(format!("nats://127.0.0.1:{port}"))
+            .await
+            .unwrap();
+        client.publish("test", "data".into()).await.unwrap();
+        let flush = client.flush();
+        tokio::pin!(flush);
+        let (mut write, _lines) = tokio::select! {
+            biased;
+            flushed = &mut flush => panic!("flush returned before the server answered its PING: {flushed:?}"),
+            read = read => read.unwrap(),
+        };
+        // The server has read the publish and the flush's PING, and has not answered.
+        assert!(
+            futures_util::FutureExt::now_or_never(&mut flush).is_none(),
+            "flush returned before the server answered its PING"
+        );
+        write.write_all(b"PONG\r\n").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), flush)
+            .await
+            .expect("flush returns within 5 s of the PONG")
+            .expect("flush succeeds once the PONG came");
+    }
+
+    // A flush whose PONG never comes, because the connection closed, fails: the server may not have
+    // read what was written before its PING.
+    #[tokio::test]
+    async fn flush_fails_when_the_connection_closes_before_the_server_answers_its_ping() {
+        let (port, read) = flush_server().await;
+        let client = async_nats::connect(format!("nats://127.0.0.1:{port}"))
+            .await
+            .unwrap();
+        client.publish("test", "data".into()).await.unwrap();
+        let flush = client.flush();
+        tokio::pin!(flush);
+        let (write, lines) = tokio::select! {
+            biased;
+            flushed = &mut flush => panic!("flush returned before the server answered its PING: {flushed:?}"),
+            read = read => read.unwrap(),
+        };
+        drop((write, lines));
+        let flushed = tokio::time::timeout(Duration::from_secs(5), flush)
+            .await
+            .expect("flush returns within 5 s of the connection closing");
+        assert_eq!(
+            flushed.expect_err("flush fails without the PONG").kind(),
+            async_nats::client::FlushErrorKind::FlushError
+        );
     }
 
     #[tokio::test]
